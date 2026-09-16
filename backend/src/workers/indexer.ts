@@ -51,6 +51,55 @@ function decodeTopics(topic: unknown[]): string[] {
 }
 
 /**
+ * Decode a Soroban BytesN<32> event field to a hex string.
+ *
+ * The Soroban RPC can return byte arrays in several forms depending on SDK
+ * version and serialisation path:
+ *   - A Buffer / Uint8Array (already binary)
+ *   - A base64 string (from JSON-encoded XDR)
+ *   - A hex string (from some SDK helpers)
+ *
+ * We normalise all three to a lowercase hex string.
+ */
+function decodeDocHash(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+
+  // Already a Buffer or Uint8Array
+  if (Buffer.isBuffer(raw)) {
+    return raw.toString('hex');
+  }
+  if (raw instanceof Uint8Array) {
+    return Buffer.from(raw).toString('hex');
+  }
+
+  if (typeof raw === 'string') {
+    if (raw.length === 0) return null;
+
+    // 64-char lowercase hex — already decoded
+    if (/^[0-9a-f]{64}$/i.test(raw)) {
+      return raw.toLowerCase();
+    }
+
+    // Try base64 (standard or URL-safe)
+    try {
+      const buf = Buffer.from(raw, 'base64');
+      // A valid SHA-256 base64 decodes to exactly 32 bytes
+      if (buf.length === 32) {
+        return buf.toString('hex');
+      }
+    } catch {
+      // not valid base64 — fall through
+    }
+
+    // Unknown format — log and return null rather than storing garbage
+    console.warn(`decodeDocHash: unrecognised format (length=${raw.length}), ignoring`);
+    return null;
+  }
+
+  return null;
+}
+
+/**
  * Decode the event value payload to a plain object.
  */
 function decodeValue(value: unknown): Record<string, unknown> {
@@ -82,9 +131,7 @@ async function processTransferEvent(event: ContractEvent): Promise<void> {
   const fromAddr = String(rawValue['from'] ?? rawValue['fromAddr'] ?? '');
   const toAddr = String(rawValue['to'] ?? rawValue['toAddr'] ?? '');
   const location = String(rawValue['location'] ?? '');
-  const docHash = rawValue['doc_hash']
-    ? Buffer.from(String(rawValue['doc_hash']), 'base64').toString('hex')
-    : null;
+  const docHash = decodeDocHash(rawValue['doc_hash'] ?? rawValue['docHash']);
   const timestampRaw = rawValue['timestamp'];
   const eventTimestamp = timestampRaw
     ? new Date(Number(timestampRaw) * 1000)
@@ -141,9 +188,7 @@ async function processBatchRegisteredEvent(event: ContractEvent): Promise<void> 
   const batchId = toBigInt(rawValue['batch_id'] ?? rawValue['batchId']);
   const producerAddr = String(rawValue['producer'] ?? rawValue['producerAddr'] ?? '');
   const metadataHashRaw = rawValue['metadata_hash'] ?? rawValue['metadataHash'];
-  const metadataHash = metadataHashRaw
-    ? Buffer.from(String(metadataHashRaw), 'base64').toString('hex')
-    : '';
+  const metadataHash = decodeDocHash(metadataHashRaw) ?? '';
 
   if (batchId === null) {
     logger.warn({ eventId: event.id }, 'Indexer: could not decode batchId from register event');
@@ -192,11 +237,14 @@ async function runCycle(): Promise<void> {
     try {
       const topics = decodeTopics(event.topic as unknown[]);
 
-      // Detect event type by topic conventions
+      // Detect event type by topic conventions.
+      // Contract emits:
+      //   register_batch:    (symbol_short!("batch"), symbol_short!("register"))
+      //   transfer_custody:  (symbol_short!("custody"), symbol_short!("transfer"))
       const isCustodyTransfer =
         topics.includes('custody') && topics.includes('transfer');
       const isBatchRegistered =
-        topics.includes('batch') && topics.includes('registered');
+        topics.includes('batch') && topics.includes('register');
 
       if (isCustodyTransfer) {
         await processTransferEvent(event);
@@ -215,20 +263,30 @@ async function runCycle(): Promise<void> {
     }
   }
 
-  // Advance checkpoint to the highest ledger seen
+  // Advance checkpoint to one past the highest ledger seen.
+  // Using maxLedger + 1 means the next poll starts from the ledger AFTER
+  // the last one we processed, so we never re-process events from that ledger.
   if (maxLedger > startLedger) {
-    await updateCheckpoint(maxLedger);
-    logger.debug({ checkpoint: maxLedger }, 'Indexer: checkpoint updated');
+    await updateCheckpoint(maxLedger + 1);
+    logger.debug({ checkpoint: maxLedger + 1 }, 'Indexer: checkpoint updated');
   }
 }
 
 let indexerTimer: NodeJS.Timeout | null = null;
+let indexerRunning = false; // concurrency guard — prevents double-start
 
 /**
  * Start the background indexer.
  * Seeds the DB checkpoint on first run and polls every 5 seconds.
+ * Safe to call multiple times — subsequent calls are ignored.
  */
 export async function startIndexer(): Promise<void> {
+  if (indexerRunning) {
+    logger.warn('startIndexer called while already running — ignoring duplicate start');
+    return;
+  }
+  indexerRunning = true;
+
   logger.info({ pollIntervalMs: POLL_INTERVAL_MS }, 'Starting chain event indexer');
 
   // Seed checkpoint if missing
@@ -256,6 +314,7 @@ export function stopIndexer(): void {
   if (indexerTimer) {
     clearInterval(indexerTimer);
     indexerTimer = null;
+    indexerRunning = false;
     logger.info('Indexer stopped');
   }
 }

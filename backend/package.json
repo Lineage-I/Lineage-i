@@ -7,6 +7,9 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc --project tsconfig.json",
     "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate deploy",
@@ -42,9 +45,13 @@
     "@types/multer": "^1.4.11",
     "@types/node": "^20.12.2",
     "@types/qrcode": "^1.5.5",
+    "@types/supertest": "^6.0.2",
+    "@vitest/coverage-v8": "^1.4.0",
     "pino-pretty": "^11.0.0",
     "prisma": "^5.10.2",
+    "supertest": "^6.3.4",
     "tsx": "^4.7.2",
-    "typescript": "^5.4.3"
+    "typescript": "^5.4.3",
+    "vitest": "^1.4.0"
   }
 }

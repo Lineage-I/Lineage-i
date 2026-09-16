@@ -22,12 +22,23 @@ function getRpcServer(): SorobanRpc.Server {
 }
 
 // Lazy singleton — secret is decoded once and held in a single Keypair instance.
+// SECURITY NOTE: The secret lives in memory for the lifetime of the process.
+// In production, use a secrets manager (AWS Secrets Manager, HashiCorp Vault)
+// and consider re-fetching the secret per-operation rather than caching it.
 let _adminKeypair: Keypair | null = null;
 function getAdminKeypair(): Keypair {
   if (!_adminKeypair) {
     _adminKeypair = Keypair.fromSecret(config.adminSecretKey);
   }
   return _adminKeypair;
+}
+
+/**
+ * Clear the in-memory admin keypair. Call this during graceful shutdown so the
+ * secret does not linger in memory after the process begins its shutdown sequence.
+ */
+export function clearAdminKeypair(): void {
+  _adminKeypair = null;
 }
 
 function getContract(): Contract {
@@ -307,6 +318,17 @@ export async function buildTransferCustodyTx(
   const server = getRpcServer();
   const contract = getContract();
 
+  // Validate docHashHex before converting — Buffer.from with 'hex' encoding
+  // silently ignores non-hex characters and produces wrong-length output for
+  // odd-length strings. We enforce exactly 64 hex chars (32 bytes) here.
+  if (!/^[0-9a-fA-F]{64}$/.test(docHashHex)) {
+    throw new AppError(
+      `docHashHex must be exactly 64 hex characters (32 bytes), got length ${docHashHex.length}`,
+      400,
+      'INVALID_DOC_HASH'
+    );
+  }
+
   const docHashBytes = Buffer.from(docHashHex, 'hex');
 
   const operation = contract.call(
@@ -358,6 +380,8 @@ export async function fetchContractEvents(startLedger: number): Promise<unknown[
 
 /**
  * Poll until a transaction reaches a terminal state (SUCCESS or FAILED).
+ * Uses exponential backoff starting at 1 s, doubling each attempt, capped at 8 s.
+ * Total worst-case wait: ~2 min across 30 attempts.
  */
 export async function pollTransactionResult(
   hash: string,
@@ -366,13 +390,18 @@ export async function pollTransactionResult(
   const server = getRpcServer();
   const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+  const BASE_DELAY_MS = 1_000;
+  const MAX_DELAY_MS = 8_000;
+
   let attempt = 0;
   while (attempt < maxAttempts) {
     const result = await server.getTransaction(hash);
     if (result.status !== SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
       return result;
     }
-    await delay(2000);
+    // Exponential backoff: 1 s, 2 s, 4 s, 8 s, 8 s, 8 s, …
+    const backoff = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), MAX_DELAY_MS);
+    await delay(backoff);
     attempt++;
   }
 

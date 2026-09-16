@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { config } from '../config';
+import { prisma } from '../db';
 import { UnauthorizedError, ForbiddenError } from '../utils/errors';
 
 export interface AuthPayload {
@@ -45,8 +46,22 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
       throw new UnauthorizedError('Invalid token payload');
     }
 
-    req.actor = { address: payload.address, role: payload.role };
-    next();
+    // Per-request DB check: reject tokens belonging to deactivated actors.
+    // This ensures that deactivating an actor takes effect immediately rather
+    // than waiting for the 7-day JWT TTL to expire.
+    prisma.actor
+      .findUnique({ where: { address: payload.address }, select: { active: true } })
+      .then((actor) => {
+        if (!actor) {
+          return next(new UnauthorizedError('Actor not found'));
+        }
+        if (!actor.active) {
+          return next(new UnauthorizedError('Actor account has been deactivated'));
+        }
+        req.actor = { address: payload.address, role: payload.role };
+        next();
+      })
+      .catch((err) => next(err));
   } catch (err) {
     if (err instanceof jwt.JsonWebTokenError || err instanceof jwt.TokenExpiredError) {
       next(new UnauthorizedError('Invalid or expired token'));

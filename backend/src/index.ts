@@ -12,6 +12,7 @@ import { logger } from './utils/logger';
 import { prisma } from './db';
 import { errorHandler } from './middleware/errorHandler';
 import { startIndexer, stopIndexer } from './workers/indexer';
+import { clearAdminKeypair } from './services/stellar';
 
 import authRoutes from './routes/auth';
 import actorsRoutes from './routes/actors';
@@ -98,6 +99,11 @@ const publicBatchLimiter = rateLimit({
 app.use(generalLimiter);
 app.use('/auth', authLimiter);
 app.use('/batches/:id', publicBatchLimiter);
+// Also rate-limit the chainId lookup used by the QR verify flow
+app.use('/batches/chain', publicBatchLimiter);
+// Rate-limit the static QR image directory to match /batches/:id/qr.
+// Without this, sequential enumeration of QR filenames bypasses the batch limiter.
+app.use('/qr', publicBatchLimiter);
 
 // ─── Static QR image serving ──────────────────────────────────────────────────
 
@@ -140,16 +146,28 @@ async function shutdown(signal: string): Promise<void> {
 
   stopIndexer();
 
-  server.close(async () => {
-    logger.info('HTTP server closed');
-    try {
-      await prisma.$disconnect();
-      logger.info('Database connection closed');
-    } catch (err) {
-      logger.error({ err }, 'Error disconnecting from database');
-    }
-    process.exit(0);
-  });
+  // Clear the in-memory admin keypair so the secret does not linger
+  // in process memory during the shutdown sequence.
+  clearAdminKeypair();
+
+  const closeServer = (): Promise<void> =>
+    new Promise((resolve) => {
+      if (!server) return resolve();
+      server.close(async () => {
+        logger.info('HTTP server closed');
+        resolve();
+      });
+    });
+
+  await closeServer();
+
+  try {
+    await prisma.$disconnect();
+    logger.info('Database connection closed');
+  } catch (err) {
+    logger.error({ err }, 'Error disconnecting from database');
+  }
+  process.exit(0);
 
   // Force exit after 30s if graceful shutdown hangs
   setTimeout(() => {
@@ -171,21 +189,28 @@ process.on('uncaughtException', (err) => {
 });
 
 // ─── Start server ─────────────────────────────────────────────────────────────
+// Guard: in test mode supertest binds its own ephemeral port — do not start
+// a persistent listener, which would hold the process open and conflict with
+// the test runner's port management.
 
-const server = app.listen(config.port, () => {
-  logger.info(
-    { port: config.port, env: config.nodeEnv, contractId: config.contractId },
-    'Lineage backend started'
-  );
+let server: ReturnType<typeof app.listen> | null = null;
 
-  // Boot the chain event indexer
-  startIndexer().catch((err) =>
-    logger.error({ err }, 'Failed to start indexer')
-  );
-});
+if (process.env['NODE_ENV'] !== 'test') {
+  server = app.listen(config.port, () => {
+    logger.info(
+      { port: config.port, env: config.nodeEnv, contractId: config.contractId },
+      'Lineage backend started'
+    );
 
-// Keep connections alive under load
-server.keepAliveTimeout = 65_000;
-server.headersTimeout = 66_000;
+    // Boot the chain event indexer
+    startIndexer().catch((err) =>
+      logger.error({ err }, 'Failed to start indexer')
+    );
+  });
+
+  // Keep connections alive under load
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
+}
 
 export default app;

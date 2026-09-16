@@ -172,7 +172,8 @@ function RegisterBatchTab() {
       fd.append('harvestDate', form.harvestDate);
       fd.append('notes', form.notes);
       fd.append('producerAddr', actor.address);
-      files.forEach((f) => fd.append('documents', f));
+      // Backend multer is configured with upload.array('files', 5) — field name must match.
+      files.forEach((f) => fd.append('files', f));
 
       const prepared = await api.prepareBatch(fd);
 
@@ -350,12 +351,12 @@ function RegisterBatchTab() {
           >
             <Upload className="w-8 h-8 text-gray-400 mx-auto mb-2" />
             <p className="text-sm text-gray-600 font-medium">Click to upload</p>
-            <p className="text-xs text-gray-400 mt-1">PDF, JPG, PNG up to 20MB</p>
+            <p className="text-xs text-gray-400 mt-1">PDF, JPG, PNG, WebP up to 10 MB · max 5 files</p>
             <input
               ref={fileRef}
               type="file"
               multiple
-              accept=".pdf,.jpg,.jpeg,.png"
+              accept=".pdf,.jpg,.jpeg,.png,.webp"
               className="hidden"
               onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
             />
@@ -665,7 +666,10 @@ function AdminTab() {
     }
   }
 
-  const roles: Role[] = ['Producer', 'Processor', 'Distributor', 'Retailer', 'Auditor', 'Admin'];
+  // Admin is set at deploy time only — it cannot be assigned through this UI.
+  // Exposing it here could mislead admins into attempting to create a second
+  // admin actor, which the backend schema and contract do not support via this endpoint.
+  const roles: Role[] = ['Producer', 'Processor', 'Distributor', 'Retailer', 'Auditor'];
 
   return (
     <div className="space-y-8">

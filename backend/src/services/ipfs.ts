@@ -93,10 +93,22 @@ export function hashBuffer(buffer: Buffer): Buffer {
 /**
  * Encode a CID string to a fixed 32-byte Buffer for on-chain storage.
  * The CID is UTF-8 encoded then truncated or zero-padded to exactly 32 bytes.
- * The actual full CID is stored off-chain (DB/event).
+ *
+ * WARNING: CIDv1 strings are typically 59+ characters. If the encoded CID
+ * exceeds 32 bytes it will be truncated and the stored value will NOT
+ * represent the full CID. Store the full CID off-chain (DB / event) and only
+ * use this function for fingerprinting, not for reconstruction.
  */
 export function cidToBytes32(cid: string): Buffer {
   const encoded = Buffer.from(cid, 'utf8');
+  if (encoded.length > 32) {
+    // Log a warning so callers are aware of the truncation at development time.
+    // In production this is expected behaviour — full CID lives in the DB/events.
+    console.warn(
+      `cidToBytes32: CID "${cid.slice(0, 12)}…" is ${encoded.length} bytes, ` +
+      `truncating to 32. Ensure the full CID is stored off-chain.`
+    );
+  }
   const result = Buffer.alloc(32, 0);
   encoded.copy(result, 0, 0, Math.min(encoded.length, 32));
   return result;

@@ -158,16 +158,18 @@ router.post(
         }
       }
 
-      // Upload each file to IPFS with sanitized filename
+      // Upload each file to IPFS. All uploads must succeed — we use Promise.all
+      // so that a single failure aborts the entire prepare step rather than
+      // accepting partial results and storing an incomplete metadataHash.
       const files = (req.files as Express.Multer.File[]) ?? [];
-      const ipfsUploads: Array<{ filename: string; cid: string; url: string; hash: string }> = [];
-
-      for (const file of files) {
-        const safeName = sanitizeFilename(file.originalname);
-        const { cid, url } = await uploadToIPFS(file.buffer, safeName, file.mimetype);
-        const hash = hashBuffer(file.buffer).toString('hex');
-        ipfsUploads.push({ filename: safeName, cid, url, hash });
-      }
+      const ipfsUploads = await Promise.all(
+        files.map(async (file) => {
+          const safeName = sanitizeFilename(file.originalname);
+          const { cid, url } = await uploadToIPFS(file.buffer, safeName, file.mimetype);
+          const hash = hashBuffer(file.buffer).toString('hex');
+          return { filename: safeName, cid, url, hash };
+        })
+      );
 
       // Compute metadata hash
       const metadataForHash = { ...metadata, ipfsCids: ipfsUploads.map((u) => u.cid) };
@@ -225,16 +227,33 @@ router.post(
       // Generate QR code using the real on-chain ID
       const qrCodePath = await generateQRCode(batchChainId.toString());
 
-      const batch = await prisma.batch.create({
-        data: {
-          chainId: batchChainId,
-          producerAddr: producerAddress,
-          metadataHash,
-          metadata: (metadata as Prisma.InputJsonValue) ?? {},
-          qrCodePath,
-          currentHolder: producerAddress,
-        },
-      });
+      let batch;
+      try {
+        batch = await prisma.batch.create({
+          data: {
+            chainId: batchChainId,
+            producerAddr: producerAddress,
+            metadataHash,
+            metadata: (metadata as Prisma.InputJsonValue) ?? {},
+            qrCodePath,
+            currentHolder: producerAddress,
+          },
+        });
+      } catch (dbErr) {
+        // The on-chain TX already landed. If the DB write fails, clean up the
+        // orphaned QR file so it doesn't accumulate on disk.
+        try {
+          const filename = path.basename(qrCodePath);
+          const resolvedStorage = path.resolve(config.qrStoragePath);
+          const filePath = path.resolve(resolvedStorage, filename);
+          if (filePath.startsWith(resolvedStorage + path.sep)) {
+            fs.unlink(filePath, () => {}); // best-effort, don't block response
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+        throw dbErr;
+      }
 
       logger.info({ batchId: batch.id, chainId: batchChainId.toString(), txHash }, 'Batch stored in DB');
       res.status(201).json({
@@ -333,45 +352,133 @@ router.post(
       // Verify XDR signer matches authenticated actor
       assertXdrSigner(signedXdr, actorAddress);
 
+      // RACE CONDITION NOTE: There is a window between /transfer/prepare (which
+      // built and returned the unsigned XDR) and this submit call. During that
+      // window another request could transfer the same batch, making the XDR
+      // stale. We detect this by re-verifying the current holder here (inside a
+      // serializable transaction) before submitting to chain. If the holder has
+      // changed, we reject early and the chain TX is never sent.
+      //
+      // Limitation: we cannot prevent the on-chain TX from landing if it is
+      // submitted by the client directly. The indexer will reconcile any
+      // resulting state divergence.
+
       // Serializable transaction: re-verify holder and update atomically
       const batch = await prisma.$transaction(
         async (tx) => {
           const b = await tx.batch.findUnique({ where: { id } });
           if (!b) throw new NotFoundError(`Batch ${id} not found`);
           if (b.currentHolder !== actorAddress) {
-            throw new ForbiddenError('You are not the current holder of this batch');
+            throw new ForbiddenError(
+              'You are no longer the current holder of this batch. ' +
+              'The batch may have already been transferred. Please refresh and try again.'
+            );
           }
           return b;
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
 
-      // Submit to chain
+      // Submit to chain — this is irreversible once confirmed.
       const { hash: txHash } = await submitSignedXdr(signedXdr);
       logger.info({ batchId: id, txHash, from: actorAddress, to: toAddress }, 'Transfer TX confirmed');
 
-      // Record event and update holder atomically
-      const [event] = await prisma.$transaction([
-        prisma.chainEvent.create({
-          data: {
-            batchChainId: batch.chainId,
-            fromAddr: actorAddress,
-            toAddr: toAddress,
-            location,
-            docHash: docHash ?? null,
-            docIpfsCid: docIpfsCid ?? null,
-            docIpfsUrl: docIpfsUrl ?? null,
-            txHash,
-            eventTimestamp: new Date(),
-          },
-        }),
-        prisma.batch.update({
-          where: { id },
-          data: { currentHolder: toAddress },
-        }),
-      ]);
+      // Record event and update holder atomically.
+      // If this write fails we log an alert — the indexer will eventually
+      // reconcile state by replaying the on-chain event.
+      try {
+        const [event] = await prisma.$transaction([
+          prisma.chainEvent.create({
+            data: {
+              batchChainId: batch.chainId,
+              fromAddr: actorAddress,
+              toAddr: toAddress,
+              location,
+              docHash: docHash ?? null,
+              docIpfsCid: docIpfsCid ?? null,
+              docIpfsUrl: docIpfsUrl ?? null,
+              txHash,
+              eventTimestamp: new Date(),
+            },
+          }),
+          prisma.batch.update({
+            where: { id },
+            data: { currentHolder: toAddress },
+          }),
+        ]);
 
-      res.json({ event: { ...event, batchChainId: event.batchChainId.toString() }, txHash });
+        res.json({ event: { ...event, batchChainId: event.batchChainId.toString() }, txHash });
+      } catch (dbErr) {
+        // The chain TX already landed — log prominently so operators can
+        // manually reconcile. The background indexer will also catch this
+        // event and write it to the DB on its next cycle.
+        logger.error(
+          { dbErr, txHash, batchId: id, from: actorAddress, to: toAddress },
+          'Transfer TX confirmed on-chain but DB write failed — indexer will reconcile'
+        );
+        // Return the txHash so the client knows the transfer landed on-chain.
+        res.status(202).json({
+          txHash,
+          warning:
+            'Transfer confirmed on-chain. Database update failed and will be reconciled automatically.',
+        });
+      }
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ─── GET /batches/chain/:chainId ──────────────────────────────────────────────
+// Lookup by on-chain u64 ID — used by the QR code verify flow.
+// The QR URL encodes the chainId (e.g. /verify/1), not the DB CUID.
+
+router.get(
+  '/chain/:chainId',
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const rawChainId = req.params.chainId;
+      let chainId: bigint;
+      try {
+        chainId = BigInt(rawChainId);
+      } catch {
+        throw new BadRequestError(`chainId must be a valid integer, got: ${rawChainId}`);
+      }
+
+      const batch = await prisma.batch.findUnique({
+        where: { chainId },
+        include: {
+          events: { orderBy: { eventTimestamp: 'asc' } },
+        },
+      });
+
+      if (!batch) throw new NotFoundError(`Batch with chainId ${rawChainId} not found`);
+
+      const addresses = [
+        ...new Set([
+          batch.producerAddr,
+          ...batch.events.flatMap((e) => [e.fromAddr, e.toAddr]),
+        ]),
+      ];
+      const actors = await prisma.actor.findMany({
+        where: { address: { in: addresses } },
+        select: { address: true, name: true, role: true },
+      });
+      const actorMap = new Map(actors.map((a) => [a.address, a]));
+
+      res.json({
+        batch: {
+          ...batch,
+          chainId: batch.chainId.toString(),
+          producer: actorMap.get(batch.producerAddr) ?? null,
+          events: batch.events.map((e) => ({
+            ...e,
+            batchChainId: e.batchChainId.toString(),
+            fromActor: actorMap.get(e.fromAddr) ?? null,
+            toActor: actorMap.get(e.toAddr) ?? null,
+          })),
+        },
+      });
     } catch (err) {
       next(err);
     }
@@ -396,7 +503,10 @@ router.get(
       if (!batch) throw new NotFoundError(`Batch ${id} not found`);
 
       const addresses = [
-        ...new Set(batch.events.flatMap((e) => [e.fromAddr, e.toAddr])),
+        ...new Set([
+          batch.producerAddr,
+          ...batch.events.flatMap((e) => [e.fromAddr, e.toAddr]),
+        ]),
       ];
       const actors = await prisma.actor.findMany({
         where: { address: { in: addresses } },
@@ -408,6 +518,9 @@ router.get(
         batch: {
           ...batch,
           chainId: batch.chainId.toString(),
+          // Attach the resolved producer actor so consumers don't have to
+          // do a second request — falls back to null if not yet in DB.
+          producer: actorMap.get(batch.producerAddr) ?? null,
           events: batch.events.map((e) => ({
             ...e,
             batchChainId: e.batchChainId.toString(),
@@ -438,8 +551,16 @@ router.get(
       if (!batch) throw new NotFoundError(`Batch ${id} not found`);
       if (!batch.qrCodePath) throw new NotFoundError(`QR code not yet generated for batch ${id}`);
 
+      // Defend against path traversal: strip directory components, then resolve
+      // the final path and verify it is still inside qrStoragePath.
       const filename = path.basename(batch.qrCodePath);
-      const filePath = path.join(config.qrStoragePath, filename);
+      const resolvedStorage = path.resolve(config.qrStoragePath);
+      const filePath = path.resolve(resolvedStorage, filename);
+
+      // Ensure the resolved path is strictly inside the storage directory
+      if (!filePath.startsWith(resolvedStorage + path.sep) && filePath !== resolvedStorage) {
+        throw new NotFoundError(`QR file not found on disk for batch ${id}`);
+      }
 
       if (!fs.existsSync(filePath)) {
         throw new NotFoundError(`QR file not found on disk for batch ${id}`);

@@ -9,6 +9,7 @@ import {
   Calendar,
   ExternalLink,
   ShieldCheck,
+  RefreshCw,
 } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
 import * as api from '../services/api';
@@ -61,11 +62,16 @@ export function VerifyPage() {
     isLoading,
     isError,
     error,
+    refetch,
   } = useQuery({
     queryKey: ['batch', batchId],
     queryFn: () => api.getBatch(batchId!),
     enabled: !!batchId,
-    retry: 1,
+    // Retry up to 3 times with exponential backoff before showing the error
+    // state. A single transient RPC hiccup should not surface "Batch Not Found"
+    // to consumers scanning a QR code.
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10_000),
   });
 
   if (!batchId) {
@@ -122,9 +128,16 @@ export function VerifyPage() {
                   {error.message}
                 </p>
               )}
+              <button
+                onClick={() => refetch()}
+                className="inline-flex items-center justify-center gap-2 mt-4 px-5 py-3 rounded-2xl bg-white/10 hover:bg-white/20 text-white text-sm font-medium transition-colors w-full"
+              >
+                <RefreshCw className="w-4 h-4" />
+                Try again
+              </button>
               <Link
                 to="/"
-                className="inline-flex items-center justify-center gap-2 mt-6 px-5 py-3 rounded-2xl bg-stellar-600 hover:bg-stellar-500 text-white text-sm font-semibold transition-colors w-full"
+                className="inline-flex items-center justify-center gap-2 mt-3 px-5 py-3 rounded-2xl bg-stellar-600 hover:bg-stellar-500 text-white text-sm font-semibold transition-colors w-full"
               >
                 Return to home
               </Link>

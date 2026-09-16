@@ -38,10 +38,15 @@ async function handleResponse<T>(res: Response): Promise<T> {
 }
 
 export async function getBatch(id: string): Promise<Batch> {
-  const res = await fetch(`${BASE_URL}/batches/${id}`, {
+  // The QR code encodes the on-chain chainId (a u64 integer), not the DB CUID.
+  // We route through /batches/chain/:chainId so that scanned QR codes resolve
+  // correctly. The DB CUID lookup (GET /batches/:id) remains for internal use.
+  const res = await fetch(`${BASE_URL}/batches/chain/${encodeURIComponent(id)}`, {
     headers: { 'Content-Type': 'application/json' },
   });
-  return handleResponse<Batch>(res);
+  // Backend returns { batch: Batch }
+  const data = await handleResponse<{ batch: Batch }>(res);
+  return data.batch;
 }
 
 export async function getActors(role?: string): Promise<Actor[]> {
@@ -49,14 +54,19 @@ export async function getActors(role?: string): Promise<Actor[]> {
     ? `${BASE_URL}/actors?role=${encodeURIComponent(role)}`
     : `${BASE_URL}/actors`;
   const res = await fetch(url, { headers: getAuthHeaders() });
-  return handleResponse<Actor[]>(res);
+  // Backend returns { actors: Actor[], total: number }
+  const data = await handleResponse<{ actors: Actor[]; total: number }>(res);
+  return data.actors;
 }
 
 export async function getMyBatches(): Promise<Batch[]> {
-  const res = await fetch(`${BASE_URL}/batches/mine`, {
+  // Backend route is GET /batches (with auth), not /batches/mine
+  const res = await fetch(`${BASE_URL}/batches`, {
     headers: getAuthHeaders(),
   });
-  return handleResponse<Batch[]>(res);
+  // Backend returns { batches: Batch[], pagination: {...} }
+  const data = await handleResponse<{ batches: Batch[]; pagination: unknown }>(res);
+  return data.batches;
 }
 
 export async function registerActor(data: {
@@ -88,12 +98,15 @@ export async function submitBatch(data: {
   metadata: object;
   ipfsCids: string[];
 }): Promise<Batch> {
-  const res = await fetch(`${BASE_URL}/batches/submit`, {
+  // Backend route is POST /batches, not /batches/submit
+  const res = await fetch(`${BASE_URL}/batches`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify(data),
   });
-  return handleResponse<Batch>(res);
+  // Backend returns { batch: Batch, txHash, qrCodePath, ipfsCids }
+  const result = await handleResponse<{ batch: Batch }>(res);
+  return result.batch;
 }
 
 export async function prepareTransfer(
@@ -118,7 +131,8 @@ export async function submitTransfer(
     docIpfsCid?: string;
   }
 ): Promise<void> {
-  const res = await fetch(`${BASE_URL}/batches/${batchId}/transfer/submit`, {
+  // Backend route is POST /batches/:id/transfer, not /:id/transfer/submit
+  const res = await fetch(`${BASE_URL}/batches/${batchId}/transfer`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify(data),

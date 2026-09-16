@@ -13,7 +13,7 @@ import {
 import { useFreighter } from '../hooks/useFreighter';
 import { useAuth } from '../context/AuthContext';
 import * as api from '../services/api';
-import { Account, TransactionBuilder, Networks, Operation, Asset, Memo } from '@stellar/stellar-sdk';
+import { Account, TransactionBuilder, Networks, Operation, Memo } from '@stellar/stellar-sdk';
 
 const NETWORK_PASSPHRASE =
   import.meta.env.VITE_NETWORK_PASSPHRASE || Networks.TESTNET;
@@ -28,7 +28,7 @@ type LoginStep = 'idle' | 'connecting' | 'fetching-challenge' | 'signing' | 'ver
 export function LoginPage() {
   const navigate = useNavigate();
   const { actor, login } = useAuth();
-  const { publicKey, connected, freighterAvailable, loading: freighterLoading, connect, signTx } = useFreighter();
+  const { publicKey, connected, freighterAvailable, loading: freighterLoading, connect, signTx, networkMismatch } = useFreighter();
   const [step, setStep] = useState<LoginStep>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -70,15 +70,17 @@ export function LoginPage() {
       }
 
       const account = new Account(publicKey, sequenceNumber);
+      // Use ManageData instead of a payment so this works on accounts with
+      // no XLM balance (e.g. freshly created testnet accounts).
+      // ManageData only needs a valid sequence number and signature — no funds.
       const tx = new TransactionBuilder(account, {
         fee: '100',
         networkPassphrase: NETWORK_PASSPHRASE,
       })
         .addOperation(
-          Operation.payment({
-            destination: publicKey,
-            asset: Asset.native(),
-            amount: '0.0000001',
+          Operation.manageData({
+            name: 'lineage_auth',
+            value: memoText,
           })
         )
         .addMemo(Memo.text(memoText))
@@ -86,6 +88,13 @@ export function LoginPage() {
         .build();
 
       const signedXdr = await signTx(tx.toXDR(), NETWORK_PASSPHRASE);
+
+      // IMPORTANT: This signed XDR is passed directly to the backend for
+      // signature verification ONLY — it is never submitted to the Stellar
+      // network. The backend calls nacl.sign.detached.verify on the tx hash
+      // and discards the XDR afterward. Submitting this transaction on-chain
+      // would be harmless (it only sets a ManageData entry) but wastes fees,
+      // so the backend must never forward it to the RPC node.
 
       // 3. Verify with backend
       setStep('verifying');
@@ -168,6 +177,22 @@ export function LoginPage() {
                     <ExternalLink className="w-3 h-3" />
                     Install Freighter
                   </a>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Network mismatch */}
+          {networkMismatch && (
+            <div className="mb-5 p-4 rounded-2xl bg-orange-500/10 border border-orange-400/20">
+              <div className="flex gap-3">
+                <AlertCircle className="w-5 h-5 text-orange-400 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-semibold text-orange-200">Wrong network in Freighter</p>
+                  <p className="text-xs text-orange-200/70 mt-1">
+                    Freighter is not connected to the expected Stellar network.
+                    Please switch to <span className="font-mono">{import.meta.env.VITE_NETWORK_PASSPHRASE || 'Testnet'}</span> in your Freighter settings and try again.
+                  </p>
                 </div>
               </div>
             </div>
