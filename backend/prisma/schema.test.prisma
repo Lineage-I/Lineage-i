@@ -1,0 +1,68 @@
+// Test schema — mirrors the production schema but uses SQLite so tests run
+// without a Postgres instance. Used by the CI workflow and local `npm test`.
+// The generator output path is the same as production so the same import works.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Actor {
+  id          String   @id @default(cuid())
+  address     String   @unique
+  role        String
+  name        String
+  contactInfo String?
+  kycStatus   String   @default("pending")
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Batch {
+  id            String       @id @default(cuid())
+  chainId       BigInt       @unique
+  producerAddr  String
+  metadataHash  String
+  metadata      String?
+  qrCodePath    String?
+  currentHolder String
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  events        ChainEvent[]
+}
+
+model ChainEvent {
+  id             String   @id @default(cuid())
+  batchChainId   BigInt
+  batch          Batch    @relation(fields: [batchChainId], references: [chainId])
+  fromAddr       String
+  toAddr         String
+  location       String
+  docHash        String?
+  docIpfsCid     String?
+  docIpfsUrl     String?
+  txHash         String?
+  ledger         Int?
+  eventTimestamp DateTime
+  indexedAt      DateTime @default(now())
+}
+
+model IndexerCheckpoint {
+  id        Int      @id @default(1)
+  ledger    Int      @default(0)
+  updatedAt DateTime @updatedAt
+}
+
+model AuthChallenge {
+  id        String   @id @default(cuid())
+  address   String
+  challenge String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
